@@ -281,25 +281,24 @@ def root():
  
 @app.post("/agent/chat", tags=["Agent"])
 def agent_chat(session_id: str, message: str):
-    """
-    Send a message to the scheduling agent.
- 
-    First message → agent asks: coach or participant?
-    Coach flow:       Cal.com OAuth → preferences
-    Participant flow: Google OAuth → find slots → book → follow-up
-    """
     if not AGENT_AVAILABLE:
         raise HTTPException(
             status_code=503,
             detail="Agent not available. Check that coaching_agent is installed."
         )
     response = agent_manager.respond(session_id, message)
+    
+    # get_role is optional — not all agent versions have it
+    try:
+        role = agent_manager.get_role(session_id)
+    except AttributeError:
+        role = "unknown"
+    
     return {
         "session_id": session_id,
         "response":   response,
-        "role":       agent_manager.get_role(session_id),
+        "role":       role,
     }
- 
  
 @app.delete("/agent/sessions/{session_id}", tags=["Agent"])
 def delete_session(session_id: str):
