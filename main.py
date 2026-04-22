@@ -939,3 +939,17 @@ def cancel_booking(booking_id: int, db: Session = Depends(get_db)):
     return booking
 
 
+from coaching_agent import SessionManager
+manager = SessionManager()
+
+@app.post("/agent/chat", tags=["Agent"])
+def agent_chat(session_id: str, message: str):
+    response = manager.respond(session_id, message)
+    return {"session_id": session_id, "response": response}
+
+@app.delete("/agent/sessions/{session_id}", tags=["Agent"])
+def delete_session(session_id: str):
+    manager.delete(session_id)
+    return {"status": "deleted"}
+
+
