@@ -10,5 +10,5 @@ langchain-anthropic
 langgraph
 langchain-core
 requests
-git+https://github.com/TechBroMoho/Technovation-agent.git
+git+https://github.com/TechBroMoho/Technovation-agent.git@46b56b0
 
