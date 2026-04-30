@@ -114,6 +114,8 @@ BASE_URL = (
         if os.getenv("RAILWAY_PUBLIC_DOMAIN") else None)
     or "http://localhost:8000"
 )
+
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
  
  
 def calcom_headers(access_token: str = None) -> dict:
@@ -280,20 +282,23 @@ def root():
 # ══════════════════════════════════════════════════════════════════════
  
 @app.post("/agent/chat", tags=["Agent"])
-def agent_chat(session_id: str, message: str):
+async def agent_chat(session_id: str, message: str):
     if not AGENT_AVAILABLE:
         raise HTTPException(
             status_code=503,
             detail="Agent not available. Check that coaching_agent is installed."
         )
-    response = agent_manager.respond(session_id, message)
-    
-    # get_role is optional — not all agent versions have it
+    import asyncio
+    loop = asyncio.get_event_loop()
+    response = await loop.run_in_executor(
+        None, lambda: agent_manager.respond(session_id, message)
+    )
+
     try:
         role = agent_manager.get_role(session_id)
     except AttributeError:
         role = "unknown"
-    
+
     return {
         "session_id": session_id,
         "response":   response,
@@ -415,16 +420,16 @@ def calcom_login(session_id: Optional[str] = None):
             status_code=500,
             detail="CALCOM_CLIENT_ID not set. Use POST /auth/calcom/test-sync for now."
         )
+    from urllib.parse import urlencode
     state = session_id or "no-session"
     params = {
         "client_id":     CALCOM_CLIENT_ID,
         "redirect_uri":  CALCOM_REDIRECT_URI,
         "response_type": "code",
         "state":         state,
-        "scope":         "READ_PROFILE READ_EVENT_TYPE READ_BOOKING WRITE_BOOKING READ_AVAILABILITY",
+        "scope":         "READ_PROFILE READ_EVENT_TYPE READ_AVAILABILITY",
     }
-    query_string = "&".join(f"{k}={v}" for k, v in params.items())
-    return RedirectResponse(url=f"{CALCOM_AUTH_URL}?{query_string}")
+    return RedirectResponse(url=f"{CALCOM_AUTH_URL}?{urlencode(params)}")
  
  
 @app.get("/auth/calcom/callback", tags=["Cal.com OAuth"])
@@ -478,16 +483,8 @@ async def calcom_oauth_callback(code: str = None, state: str = None,
     session_id = state if state and state != "no-session" else None
     if session_id and AGENT_AVAILABLE:
         agent_manager.set_calcom_connected(session_id)
- 
-    return {
-        "status":            "success",
-        "message":           "✅ Cal.com connected! You can close this tab and return to the chat.",
-        "coach_id":          coach.id,
-        "name":              coach.name,
-        "calcom_username":   coach.calcom_username,
-        "needs_preferences": not coach.preferences_set,
-        "session_id":        session_id,
-    }
+
+    return RedirectResponse(url="https://cal.com")
  
  
 # ══════════════════════════════════════════════════════════════════════
@@ -530,8 +527,8 @@ def google_login(user_type: str = "participant", session_id: Optional[str] = Non
         "prompt":        "consent",
         "state":         state,
     }
-    query_string = "&".join(f"{k}={v.replace(' ', '%20')}" for k, v in params.items())
-    return RedirectResponse(url=f"{GOOGLE_AUTH_URL}?{query_string}")
+    from urllib.parse import urlencode
+    return RedirectResponse(url=f"{GOOGLE_AUTH_URL}?{urlencode(params)}")
  
  
 @app.get("/auth/google/callback", tags=["Google OAuth"])
