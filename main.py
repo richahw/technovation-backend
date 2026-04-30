@@ -15,7 +15,7 @@ Agent endpoints:
 """
  
 from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
@@ -118,11 +118,11 @@ BASE_URL = (
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
  
  
-def calcom_headers(access_token: str = None) -> dict:
+def calcom_headers(access_token: str = None, api_version: str = None) -> dict:
     token = access_token or CALCOM_API_KEY
     return {
         "Authorization":   f"Bearer {token}",
-        "cal-api-version": CALCOM_API_VERSION,
+        "cal-api-version": api_version or CALCOM_API_VERSION,
         "Content-Type":    "application/json",
     }
  
@@ -139,8 +139,12 @@ async def calcom_get_me(access_token: str = None) -> dict:
  
  
 async def calcom_get_event_types(access_token: str = None) -> dict:
+    # /v2/event-types requires cal-api-version: 2024-06-14
     async with httpx.AsyncClient() as client:
-        r = await client.get(f"{CALCOM_BASE_URL}/event-types", headers=calcom_headers(access_token))
+        r = await client.get(
+            f"{CALCOM_BASE_URL}/event-types",
+            headers=calcom_headers(access_token, api_version="2024-06-14"),
+        )
     r.raise_for_status()
     return r.json().get("data", r.json())
  
@@ -205,10 +209,15 @@ def store_calcom_profile_to_db(coach: models.Coach, profile: dict,
     coach.calcom_user_id             = str(profile.get("id", ""))
     coach.calcom_username            = profile.get("username", "")
     coach.calcom_default_schedule_id = str(profile.get("defaultScheduleId", ""))
-    raw = event_types_data.get("eventTypes", [])
+    # v2 returns either a bare list or {"eventTypes": [...]} depending on the version.
+    if isinstance(event_types_data, list):
+        raw = event_types_data
+    else:
+        raw = event_types_data.get("eventTypes") or event_types_data.get("event_types") or []
     coach.calcom_event_types = [
         {"id": et.get("id"), "title": et.get("title"),
-         "length": et.get("lengthInMinutes"), "slug": et.get("slug")}
+         "length": et.get("lengthInMinutes") or et.get("length"),
+         "slug": et.get("slug")}
         for et in raw
     ]
     db.commit()
@@ -305,6 +314,26 @@ async def agent_chat(session_id: str, message: str):
         "role":       role,
     }
  
+@app.post("/agent/chat/stream", tags=["Agent"])
+async def agent_chat_stream(session_id: str, message: str):
+    """
+    Streamed variant of /agent/chat. Returns text/plain chunks as the model produces them.
+    Use with `curl --no-buffer` or any SSE/streaming-aware client.
+    """
+    if not AGENT_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Agent not available.")
+
+    async def gen():
+        async for chunk in agent_manager.respond_stream(session_id, message):
+            yield chunk
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/plain",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
+
+
 @app.delete("/agent/sessions/{session_id}", tags=["Agent"])
 def delete_session(session_id: str):
     """End a session and clear conversation history."""
@@ -422,12 +451,19 @@ def calcom_login(session_id: Optional[str] = None):
         )
     from urllib.parse import urlencode
     state = session_id or "no-session"
+    scopes = " ".join([
+        "PROFILE_READ",
+        "EVENT_TYPE_READ",
+        "BOOKING_READ",
+        "BOOKING_WRITE",
+        "SCHEDULE_READ",
+    ])
     params = {
         "client_id":     CALCOM_CLIENT_ID,
         "redirect_uri":  CALCOM_REDIRECT_URI,
         "response_type": "code",
         "state":         state,
-        "scope":         "READ_PROFILE READ_EVENT_TYPE READ_AVAILABILITY",
+        "scope":         scopes,
     }
     return RedirectResponse(url=f"{CALCOM_AUTH_URL}?{urlencode(params)}")
  
