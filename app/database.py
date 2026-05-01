@@ -26,8 +26,10 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL not set in .env file")
 
-# The engine is the actual connection to Postgres
-engine = create_engine(DATABASE_URL)
+# The engine is the actual connection to Postgres.
+# pool_pre_ping checks each connection before use so dead connections (idle
+# timeouts on Railway/Supabase) get recycled instead of failing the request.
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 # Each request gets its own session (like a temporary workspace with the DB)
 # autocommit=False means we manually commit changes (safer)

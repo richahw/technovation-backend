@@ -125,53 +125,54 @@ def calcom_headers(access_token: str = None, api_version: str = None) -> dict:
         "cal-api-version": api_version or CALCOM_API_VERSION,
         "Content-Type":    "application/json",
     }
- 
- 
+
+
+# Shared HTTP client — reuses TCP/TLS connections instead of doing a fresh
+# handshake per request. Lifecycle managed by the FastAPI lifespan below.
+HTTP_CLIENT: httpx.AsyncClient = httpx.AsyncClient(timeout=30.0)
+
+
 # ══════════════════════════════════════════════════════════════════════
 # CAL.COM HELPERS
 # ══════════════════════════════════════════════════════════════════════
- 
+
 async def calcom_get_me(access_token: str = None) -> dict:
-    async with httpx.AsyncClient() as client:
-        r = await client.get(f"{CALCOM_BASE_URL}/me", headers=calcom_headers(access_token))
+    r = await HTTP_CLIENT.get(f"{CALCOM_BASE_URL}/me", headers=calcom_headers(access_token))
     r.raise_for_status()
     return r.json().get("data", r.json())
- 
- 
+
+
 async def calcom_get_event_types(access_token: str = None) -> dict:
     # /v2/event-types requires cal-api-version: 2024-06-14
-    async with httpx.AsyncClient() as client:
-        r = await client.get(
-            f"{CALCOM_BASE_URL}/event-types",
-            headers=calcom_headers(access_token, api_version="2024-06-14"),
-        )
+    r = await HTTP_CLIENT.get(
+        f"{CALCOM_BASE_URL}/event-types",
+        headers=calcom_headers(access_token, api_version="2024-06-14"),
+    )
     r.raise_for_status()
     return r.json().get("data", r.json())
- 
- 
+
+
 async def calcom_get_slots(event_type_id: int, start_time: str, end_time: str,
                             username: Optional[str] = None, access_token: Optional[str] = None) -> dict:
     params = {"eventTypeId": event_type_id, "startTime": start_time, "endTime": end_time}
     if username:
         params["username"] = username
-    async with httpx.AsyncClient() as client:
-        r = await client.get(f"{CALCOM_BASE_URL}/slots/available",
-                             headers=calcom_headers(access_token), params=params)
+    r = await HTTP_CLIENT.get(f"{CALCOM_BASE_URL}/slots/available",
+                              headers=calcom_headers(access_token), params=params)
     r.raise_for_status()
     return r.json().get("data", r.json())
- 
- 
+
+
 async def calcom_get_bookings(status_filter: Optional[str] = None) -> dict:
     params = {}
     if status_filter:
         params["status"] = status_filter
-    async with httpx.AsyncClient() as client:
-        r = await client.get(f"{CALCOM_BASE_URL}/bookings",
-                             headers=calcom_headers(), params=params)
+    r = await HTTP_CLIENT.get(f"{CALCOM_BASE_URL}/bookings",
+                              headers=calcom_headers(), params=params)
     r.raise_for_status()
     return r.json().get("data", r.json())
- 
- 
+
+
 async def calcom_create_booking(event_type_id: int, start: str, attendee_name: str,
                                  attendee_email: str, timezone: str,
                                  access_token: Optional[str] = None) -> dict:
@@ -182,21 +183,19 @@ async def calcom_create_booking(event_type_id: int, start: str, attendee_name: s
                      "timeZone": timezone, "language": "en"},
         "metadata": {},
     }
-    async with httpx.AsyncClient() as client:
-        r = await client.post(f"{CALCOM_BASE_URL}/bookings",
-                              headers=calcom_headers(access_token), json=payload)
+    r = await HTTP_CLIENT.post(f"{CALCOM_BASE_URL}/bookings",
+                               headers=calcom_headers(access_token), json=payload)
     r.raise_for_status()
     return r.json().get("data", r.json())
- 
- 
+
+
 async def calcom_cancel_booking(uid: str, reason: str = "",
                                  access_token: Optional[str] = None) -> dict:
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            f"{CALCOM_BASE_URL}/bookings/{uid}/cancel",
-            headers=calcom_headers(access_token),
-            json={"cancellationReason": reason},
-        )
+    r = await HTTP_CLIENT.post(
+        f"{CALCOM_BASE_URL}/bookings/{uid}/cancel",
+        headers=calcom_headers(access_token),
+        json={"cancellationReason": reason},
+    )
     r.raise_for_status()
     return r.json().get("data", r.json())
  
@@ -262,13 +261,12 @@ Technovation Scheduling Platform
     message["subject"] = f"Coaching Session Confirmed - {start_time}"
  
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
- 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(
-            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
-            headers={"Authorization": f"Bearer {access_token}"},
-            json={"raw": raw},
-        )
+
+    r = await HTTP_CLIENT.post(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json={"raw": raw},
+    )
     return r.status_code
  
  
@@ -479,12 +477,11 @@ async def calcom_oauth_callback(code: str = None, state: str = None,
     if not CALCOM_CLIENT_ID or not CALCOM_CLIENT_SECRET:
         raise HTTPException(status_code=500, detail="CALCOM_CLIENT_ID or CALCOM_CLIENT_SECRET not set.")
  
-    async with httpx.AsyncClient() as client:
-        tokens = (await client.post(CALCOM_TOKEN_URL, data={
-            "code": code, "client_id": CALCOM_CLIENT_ID,
-            "client_secret": CALCOM_CLIENT_SECRET,
-            "redirect_uri": CALCOM_REDIRECT_URI, "grant_type": "authorization_code",
-        })).json()
+    tokens = (await HTTP_CLIENT.post(CALCOM_TOKEN_URL, data={
+        "code": code, "client_id": CALCOM_CLIENT_ID,
+        "client_secret": CALCOM_CLIENT_SECRET,
+        "redirect_uri": CALCOM_REDIRECT_URI, "grant_type": "authorization_code",
+    })).json()
  
     if "error" in tokens:
         raise HTTPException(status_code=400, detail=f"Token exchange failed: {tokens}")
@@ -580,12 +577,11 @@ async def google_oauth_callback(code: str = None, state: str = None,
     user_type  = parts[0] if parts else "participant"
     session_id = parts[1] if len(parts) > 1 and parts[1] != "no-session" else None
  
-    async with httpx.AsyncClient() as client:
-        tokens = (await client.post(GOOGLE_TOKEN_URL, data={
-            "code": code, "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "redirect_uri": GOOGLE_REDIRECT_URI, "grant_type": "authorization_code",
-        })).json()
+    tokens = (await HTTP_CLIENT.post(GOOGLE_TOKEN_URL, data={
+        "code": code, "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uri": GOOGLE_REDIRECT_URI, "grant_type": "authorization_code",
+    })).json()
  
     if "error" in tokens:
         raise HTTPException(status_code=400, detail=f"Token exchange failed: {tokens.get('error_description', tokens['error'])}")
@@ -594,9 +590,8 @@ async def google_oauth_callback(code: str = None, state: str = None,
     refresh_token = tokens.get("refresh_token")
     token_expiry  = datetime.utcnow() + timedelta(seconds=tokens.get("expires_in", 3600))
  
-    async with httpx.AsyncClient() as client:
-        user_info = (await client.get(GOOGLE_USERINFO_URL,
-                                      headers={"Authorization": f"Bearer {access_token}"})).json()
+    user_info = (await HTTP_CLIENT.get(GOOGLE_USERINFO_URL,
+                                        headers={"Authorization": f"Bearer {access_token}"})).json()
  
     user_email = user_info.get("email")
     if not user_email:

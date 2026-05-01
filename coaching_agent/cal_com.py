@@ -15,6 +15,9 @@ BASE_URL = "https://api.cal.com/v2"
 # Technovation team id on Cal.com. Discovered via GET /v2/teams.
 TECHNOVATION_TEAM_ID = 17818
 
+# Shared HTTP session — keep-alive avoids a TLS handshake per Cal.com call.
+_HTTP = requests.Session()
+
 
 def _headers(api_version: str = "2024-08-13") -> dict:
     return {
@@ -26,8 +29,8 @@ def _headers(api_version: str = "2024-08-13") -> dict:
 
 # ── Team event types ─────────────────────────────────────────────────────
 
-# Cache of the full team event-type list. Refreshed lazily.
-_team_events_cache: dict = {"fetched_at": 0.0, "events": []}
+# Cache of the full team event-type list, indexed by slug for O(1) lookup.
+_team_events_cache: dict = {"fetched_at": 0.0, "events": [], "by_slug": {}}
 _TEAM_EVENTS_TTL = 300.0  # seconds
 
 
@@ -42,7 +45,7 @@ def _fetch_team_events(force: bool = False) -> list[dict]:
         return _team_events_cache["events"]
 
     try:
-        resp = requests.get(
+        resp = _HTTP.get(
             f"{BASE_URL}/teams/{TECHNOVATION_TEAM_ID}/event-types",
             headers=_headers("2024-06-14"),
             timeout=15,
@@ -51,6 +54,7 @@ def _fetch_team_events(force: bool = False) -> list[dict]:
             return []
         events = resp.json().get("data") or []
         _team_events_cache["events"] = events
+        _team_events_cache["by_slug"] = {e.get("slug"): e for e in events if e.get("slug")}
         _team_events_cache["fetched_at"] = now
         return events
     except requests.RequestException:
@@ -59,14 +63,8 @@ def _fetch_team_events(force: bool = False) -> list[dict]:
 
 def get_team_event_by_slug(slug: str) -> dict | None:
     """Return the team event-type record for the given slug, or None."""
-    for e in _fetch_team_events():
-        if e.get("slug") == slug:
-            return e
-    # One retry in case the cache is stale
-    for e in _fetch_team_events(force=True):
-        if e.get("slug") == slug:
-            return e
-    return None
+    _fetch_team_events()  # populates / refreshes if TTL expired
+    return _team_events_cache["by_slug"].get(slug)
 
 
 def get_event_hosts(slug: str) -> list[dict]:
@@ -116,7 +114,7 @@ def fetch_event_slots(event_type_id: int, start_time: str, end_time: str) -> dic
     Returns: {"slots": {"2026-04-28": [{"start": "..."}, ...], ...}} or {"error": ...}
     """
     try:
-        resp = requests.get(
+        resp = _HTTP.get(
             f"{BASE_URL}/slots",
             headers=_headers("2024-09-04"),
             params={
@@ -180,7 +178,7 @@ def create_team_booking(
             # Cal.com v2 expects custom field answers under bookingFieldsResponses.
             payload["bookingFieldsResponses"] = answers
 
-        resp = requests.post(
+        resp = _HTTP.post(
             f"{BASE_URL}/bookings",
             headers=_headers("2024-08-13"),
             json=payload,

@@ -7,11 +7,13 @@ can read/write that state via closure.
 """
 
 import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from langchain_anthropic import ChatAnthropic
 from langgraph.prebuilt import create_react_agent
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic.v1 import SecretStr  # type: ignore[import-untyped]
 
 from coaching_agent.tools import build_tools
@@ -24,7 +26,7 @@ load_dotenv()
 
 _anthropic_key = os.getenv("ANTHROPIC_API_KEY")
 llm = ChatAnthropic(
-    model_name="claude-haiku-4-5-20251001",
+    model_name="claude-sonnet-4-6",
     api_key=SecretStr(_anthropic_key) if _anthropic_key else None,
     temperature=0,
     timeout=60,
@@ -86,12 +88,19 @@ Step 2 — Decide which coaching event to book.
 
   ROUTING PATH: Otherwise, ask these questions ONE AT A TIME, then call
   list_coaching_events(topic=..., language=..., fmt=...) with the answers as filters.
-  a) WHAT do you need coaching on? Valid topic values are exactly the keys returned by
-     list_coaching_topics — call that tool whenever the participant is unsure or gives
-     an answer that doesn't obviously match one of the known topics. NEVER invent topic
-     values; pick from what list_coaching_topics returns.
-  b) WHICH LANGUAGE would you like the session in?
-       (English, Spanish, Hindi, Russian, Mandarin, Japanese, German, French, Tamil)
+  a) WHAT do you need coaching on? BEFORE asking, call list_coaching_topics and
+     enumerate every option it returns inline as a bulleted list in your message —
+     do NOT just say "which of these" or paraphrase; the user must see the actual
+     topic labels in the message you send. Example phrasing:
+         "What do you need coaching on? Here are the topics we offer:
+            - ideation: Coming up with an idea
+            - pitch: Pitch development
+            - ... (every topic from the tool, verbatim)
+          Pick one, or describe what you need help with if none fit."
+     NEVER invent topic values; pick from what list_coaching_topics returns. If the
+     participant's first answer doesn't match a known topic, re-show the list.
+  b) WHICH LANGUAGE would you like the session in? List the supported languages inline:
+       English, Spanish, Hindi, Russian, Mandarin, Japanese, German, French, Tamil.
   c) INDIVIDUAL or GROUP session? (Group is for Club Ambassadors coordinating multiple teams.)
 
   If list_coaching_events returns nothing, loosen the filters (e.g. drop language to fall
@@ -100,16 +109,17 @@ Step 2 — Decide which coaching event to book.
 Step 3 — Confirm and select:
   - Show the participant the matching event(s). If there's exactly one, confirm it. If
     multiple, let them pick.
-  - Call select_coaching_event(slug).
-  - Then call list_event_coaches and tell the participant which coach(es) are registered
-    on that event on Cal.com. If there's only one host, just say "Your session will be
-    with <name>." If there are multiple, list them; Cal.com will round-robin assign one
-    when you book — you cannot force a specific host on a team event, so make that clear
-    if the participant asks.
+  - Call select_coaching_event(slug). This single call returns the event details, the
+    registered coaches, AND the booking-form questions in one response — you do NOT
+    need to call list_event_coaches or get_booking_questions afterwards.
+  - From its response, tell the participant which coach(es) are registered. If there's
+    only one host, say "Your session will be with <name>." If multiple, list them and
+    note that Cal.com will round-robin assign one when you book — you cannot force a
+    specific host on a team event, so make that clear if the participant asks.
 
-Step 4 — Fetch the event's booking-form questions dynamically:
-  - Call get_booking_questions. This returns the exact fields Cal.com requires for THIS
-    specific event (different events can have different custom questions).
+Step 4 — Use the booking-form questions returned by select_coaching_event:
+  - The booking-form questions are ALREADY in the response from select_coaching_event.
+    Do NOT call get_booking_questions again unless that response was truncated.
   - Name and email are already collected — do NOT ask again for those.
   - For every other field, ask the participant the question in natural language using the
     label returned by Cal.com. Required fields are labeled [REQUIRED]; you MUST collect
@@ -122,8 +132,15 @@ Step 4 — Fetch the event's booking-form questions dynamically:
 
 Step 5 — Pick a time:
   - Ask which day they'd like (today, tomorrow, a weekday name, or an ISO date).
-  - Call get_event_slots(day). Show the slots in local-time format; keep the UTC ISO
-    timestamp for booking.
+  - If the participant says something like "next available", "as soon as possible",
+    "any day this week", or doesn't pin down a specific day, call
+    get_event_slots(day='today', num_days=14) — this returns slots across the
+    next 14 days in chronological order, so you can quote the earliest one
+    without iterating day-by-day. Anchor 'today' to the date in the system
+    context, not your training intuition.
+  - If the participant gave a specific day, call get_event_slots(day=<that day>,
+    num_days=1).
+  - Show the slots in local-time format; keep the UTC ISO timestamp for booking.
   - Let the participant pick one.
   - Ask if they want to invite any additional guests (optional, comma-separated emails).
 
@@ -159,6 +176,99 @@ GENERAL RULES
   clearly in plain language and suggest what to try.
 - Be concise and friendly.
 """
+
+# The static portion of the system prompt is cached across turns; today's date
+# is appended as a separate uncached block so the model always knows what
+# "today" / "next available" mean. Only blocks marked with cache_control are
+# cached, so adding a per-turn date block does not invalidate the cache prefix.
+_CACHED_PROMPT_BLOCK = {
+    "type": "text",
+    "text": SYSTEM_PROMPT,
+    "cache_control": {"type": "ephemeral"},
+}
+
+
+def _build_date_block(tz_name: str) -> dict:
+    tz = ZoneInfo(tz_name)
+    now_local = datetime.now(tz)
+    return {
+        "type": "text",
+        "text": (
+            f"Today's date is {now_local.strftime('%A, %B %d, %Y')} "
+            f"({tz_name}, current local time {now_local.strftime('%H:%M')}). "
+            "ALWAYS use this as the anchor for any date or time reasoning. "
+            "When the user says 'today', 'tomorrow', 'next Monday', or 'as soon as "
+            "possible', interpret it relative to this date — not your training-data "
+            "intuition of 'now'."
+        ),
+    }
+
+
+def _build_state_block(session) -> dict:
+    """Render the live session state so the model can recover after the chat
+    history gets trimmed. Without this, a long booking flow loses earlier
+    tool-call results and the model restarts the greeting."""
+    lines = ["Live session state (DO NOT re-ask things already known here):"]
+    lines.append(f"  role: {session.role or '(unknown — ask)'}")
+
+    if session.role == "coach":
+        lines.append(f"  cal.com connected: {session.calcom_connected}")
+        if session.coach_id:
+            lines.append(f"  coach_id: {session.coach_id}")
+
+    if session.role == "participant":
+        if session.participant_name or session.participant_email:
+            lines.append(
+                f"  participant: {session.participant_name or '?'} "
+                f"<{session.participant_email or '?'}> "
+                f"tz={session.participant_timezone or '?'}"
+            )
+        else:
+            lines.append("  participant: not yet identified — call save_participant_info")
+
+        if session.selected_event:
+            ev = session.selected_event
+            lines.append(
+                f"  selected event: {ev.get('title')} "
+                f"(slug={ev.get('slug')}, id={session.selected_event_id}, "
+                f"length={session.selected_event_length}m)"
+            )
+        else:
+            lines.append("  selected event: none yet")
+
+        if session.booking_questions:
+            answered = session.collected_answers or {}
+            required_remaining = [
+                q["slug"] for q in session.booking_questions
+                if q.get("required")
+                and q["slug"] not in ("name", "email")
+                and q["slug"] not in answered
+            ]
+            optional_remaining = [
+                q["slug"] for q in session.booking_questions
+                if not q.get("required")
+                and q["slug"] not in ("name", "email")
+                and q["slug"] not in answered
+            ]
+            lines.append(
+                f"  booking-form answers collected: {sorted(answered.keys()) or 'none'}"
+            )
+            lines.append(
+                f"  booking-form required still missing: {required_remaining or 'none'}"
+            )
+            lines.append(
+                f"  booking-form optional still pending: {optional_remaining or 'none'}"
+            )
+
+        if session.last_booking_uid:
+            lines.append(f"  last booking uid: {session.last_booking_uid}")
+
+    lines.append(
+        "If the chat history above is short, it may have been trimmed — trust "
+        "this state block and continue the flow from where it indicates. Do "
+        "NOT restart the greeting if role is already set."
+    )
+    return {"type": "text", "text": "\n".join(lines)}
 
 # ---------------------------------------------------------------------------
 # Per-session agent + state
@@ -206,15 +316,29 @@ class CoachingAgent:
 
         # Tools are bound to this session
         self._tools = build_tools(self)
+
+        def _prompt(state):
+            tz_name = self.participant_timezone or "America/Los_Angeles"
+            return [
+                SystemMessage(content=[
+                    _CACHED_PROMPT_BLOCK,
+                    _build_date_block(tz_name),
+                    _build_state_block(self),
+                ])
+            ] + list(state["messages"])
+
         self._agent = create_react_agent(
             model=llm,
             tools=self._tools,
-            prompt=SYSTEM_PROMPT,
+            prompt=_prompt,
         )
 
     # Keep the last N user turns + everything after (preserves tool-call/result pairs,
-    # since those only live between consecutive HumanMessages).
-    HISTORY_MAX_USER_TURNS = 4
+    # since those only live between consecutive HumanMessages). A full booking flow
+    # can span 10+ user turns; the per-turn state block in the system prompt covers
+    # state recovery if trimming kicks in, but a generous window keeps conversational
+    # nuance intact for the model.
+    HISTORY_MAX_USER_TURNS = 12
 
     def _trimmed_history(self) -> list:
         if not self.chat_history:

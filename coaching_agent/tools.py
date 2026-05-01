@@ -42,6 +42,9 @@ from coaching_agent.cal_com import (
 CAL_API_KEY = os.getenv("CALCOM_API_KEY") or os.getenv("CAL_COM_API_KEY")
 CAL_BASE = "https://api.cal.com/v2"
 
+# Shared HTTP session — keep-alive avoids a TLS handshake per Cal.com call.
+_HTTP = requests.Session()
+
 
 def _cal_headers(api_version: str = "2024-08-13") -> dict:
     return {
@@ -193,15 +196,19 @@ def build_tools(session):
     @tool
     def select_coaching_event(slug: str) -> str:
         """
-        Record which coaching event the participant picked and load its real
-        Cal.com event id + booking-form questions. Pass the slug from
-        list_coaching_events (e.g. 'technovation-ideation-coaching').
+        Record which coaching event the participant picked, then return the
+        event details, registered coaches, and booking-form questions in ONE
+        response. Pass the slug from list_coaching_events (e.g.
+        'technovation-ideation-coaching'). After this you can go straight to
+        asking the booking-form questions — you do NOT need to call
+        list_event_coaches or get_booking_questions separately.
         """
-        event = find_by_slug(slug.strip())
+        slug_clean = slug.strip()
+        event = find_by_slug(slug_clean)
         if not event:
             return f"Error: no event with slug {slug!r}. Call list_coaching_events to see options."
 
-        cal_event = get_team_event_by_slug(slug.strip())
+        cal_event = get_team_event_by_slug(slug_clean)
         if not cal_event:
             return (
                 f"Error: couldn't find event {slug!r} on Cal.com (team "
@@ -212,12 +219,42 @@ def build_tools(session):
         session.selected_event = event
         session.selected_event_id = int(cal_event.get("id") or 0)
         session.selected_event_length = int(cal_event.get("lengthInMinutes") or 60)
-        session.booking_questions = calcom_booking_questions(slug.strip())
+        # Hosts and booking fields come from the same cached team-events record,
+        # so pulling them here costs nothing extra.
+        hosts = list(cal_event.get("hosts") or [])
+        session.booking_questions = calcom_booking_questions(slug_clean)
         session.collected_answers = {}
+
+        # Format hosts
+        if hosts:
+            host_lines = []
+            for h in hosts:
+                mandatory = " (mandatory)" if h.get("mandatory") else ""
+                host_lines.append(
+                    f"  - {h.get('name')} (@{h.get('username')}){mandatory}"
+                )
+            hosts_block = "Registered coaches:\n" + "\n".join(host_lines)
+        else:
+            hosts_block = "Registered coaches: none currently registered."
+
+        # Format booking questions
+        if session.booking_questions:
+            q_lines = []
+            for q in session.booking_questions:
+                marker = "[REQUIRED]" if q["required"] else "[optional]"
+                line = f"  - {marker} slug={q['slug']} type={q['type']} — {q['label']}"
+                if q.get("options"):
+                    line += f"  options={q['options']}"
+                q_lines.append(line)
+            questions_block = "Booking-form questions:\n" + "\n".join(q_lines)
+        else:
+            questions_block = "Booking-form questions: none."
+
         return (
             f"Selected event: {event['title']} (slug={event['slug']}, "
-            f"id={session.selected_event_id}, length={session.selected_event_length}m). "
-            "Next: call get_booking_questions to see the form fields this event requires."
+            f"id={session.selected_event_id}, length={session.selected_event_length}m).\n"
+            f"{hosts_block}\n"
+            f"{questions_block}"
         )
 
     @tool
@@ -274,7 +311,9 @@ def build_tools(session):
             slug: the field slug from get_booking_questions
                 (e.g. 'title', 'solution', 'division', 'question-1', 'ackowledgement').
             value: the participant's answer. For boolean fields pass 'true'/'false'.
-                For select fields pass the exact option string.
+                For select/radio fields pass the exact option label (or its value).
+                The tool also accepts a 1-based numeric index or a unique substring,
+                but rejects anything that doesn't resolve to a real option.
         """
         if not session.booking_questions:
             return "Error: no event selected. Call select_coaching_event first."
@@ -284,23 +323,86 @@ def build_tools(session):
                 f"Error: {slug!r} is not a field on this event. "
                 f"Known slugs: {sorted(known_slugs)}."
             )
-        # Coerce booleans
+
         field = next(q for q in session.booking_questions if q["slug"] == slug)
-        v: object = value
-        if field["type"] == "boolean":
-            v = str(value).strip().lower() in ("true", "yes", "y", "1", "agree", "ok")
-        session.collected_answers[slug] = v
+        field_type = (field.get("type") or "").lower()
+        options = field.get("options") or []
+
+        # Boolean coercion
+        if field_type == "boolean":
+            session.collected_answers[slug] = str(value).strip().lower() in (
+                "true", "yes", "y", "1", "agree", "ok"
+            )
+            return f"Saved answer for {slug}."
+
+        # Option-bound fields: validate the answer is actually one of the options.
+        if isinstance(options, list) and options:
+            # Normalize options to (label, value) pairs — Cal.com returns either
+            # bare strings or {label, value} dicts.
+            normalized: list[tuple[str, str]] = []
+            for opt in options:
+                if isinstance(opt, dict):
+                    label = str(opt.get("label") or opt.get("value") or "")
+                    val = str(opt.get("value") or opt.get("label") or "")
+                else:
+                    label = val = str(opt)
+                if label or val:
+                    normalized.append((label, val))
+
+            raw = str(value).strip()
+            raw_lower = raw.lower()
+            matched: str | None = None
+
+            # 1. Exact case-insensitive match on label or value
+            for label, val in normalized:
+                if raw_lower == label.lower() or raw_lower == val.lower():
+                    matched = val
+                    break
+
+            # 2. 1-based numeric index (model often presents options as "1. … 2. …")
+            if matched is None and raw.isdigit():
+                idx = int(raw) - 1
+                if 0 <= idx < len(normalized):
+                    matched = normalized[idx][1]
+
+            # 3. Unique substring of a label
+            if matched is None:
+                candidates = [v for l, v in normalized if raw_lower and raw_lower in l.lower()]
+                if len(candidates) == 1:
+                    matched = candidates[0]
+
+            if matched is None:
+                labels = [l for l, _ in normalized]
+                return (
+                    f"Error: {value!r} is not a valid option for {slug!r}. "
+                    f"Valid options: {labels}. Re-show this list to the participant "
+                    "and ask them to pick one exactly — do NOT just save 'yes' or any "
+                    "other non-option string."
+                )
+            session.collected_answers[slug] = matched
+            return f"Saved {slug} = {matched!r}."
+
+        # Free-text fields: accept as-is.
+        session.collected_answers[slug] = value
         return f"Saved answer for {slug}."
 
     # ── availability + booking ───────────────────────────────────────────
 
     @tool
-    def get_event_slots(day: str) -> str:
+    def get_event_slots(day: str = "today", num_days: int = 1) -> str:
         """
-        Fetch available time slots for the selected coaching event on a given day.
+        Fetch available time slots for the selected coaching event over a window
+        of one or more consecutive days, starting at `day`.
 
         Args:
-            day: 'today', 'tomorrow', a weekday name, or an ISO date like '2026-04-28'.
+            day: starting day. 'today', 'tomorrow', a weekday name, or an ISO
+                date like '2026-04-28'. Defaults to 'today'.
+            num_days: how many consecutive days to query starting from `day`.
+                Use 1 for a single specific day; use 7 or 14 to find the
+                "next available" without iterating. Capped at 30. Defaults to 1.
+
+        Returns slots ordered chronologically, grouped by date in the
+        participant's timezone.
         """
         if not session.selected_event_id:
             return "Error: no event selected. Call select_coaching_event first."
@@ -330,10 +432,15 @@ def build_tools(session):
                     return f"Error: couldn't understand day {day!r}."
                 target = now + timedelta(days=(wd - now.weekday()) % 7)
 
+        try:
+            window = max(1, min(int(num_days), 30))
+        except (TypeError, ValueError):
+            window = 1
+
         local_start = target.replace(hour=0, minute=0, second=0, microsecond=0)
         if local_start.tzinfo is None:
             local_start = local_start.replace(tzinfo=tz)
-        local_end = local_start + timedelta(days=1) - timedelta(seconds=1)
+        local_end = local_start + timedelta(days=window) - timedelta(seconds=1)
         utc_start = local_start.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
         utc_end = local_end.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -342,8 +449,10 @@ def build_tools(session):
             return f"Error fetching slots: {result['error']}"
 
         tz_abbrev = datetime.now(tz).strftime("%Z")
-        lines = []
-        for _date_key, times in result.get("slots", {}).items():
+        # Iterate dates in chronological order so the agent sees the EARLIEST
+        # available slot first.
+        slot_pairs: list[tuple[datetime, str]] = []
+        for _date_key, times in sorted(result.get("slots", {}).items()):
             if not isinstance(times, list):
                 continue
             for slot in times:
@@ -353,12 +462,16 @@ def build_tools(session):
                 utc_dt = datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
                 local_dt = utc_dt.astimezone(tz)
                 local_label = local_dt.strftime("%a %b %d, %I:%M %p").replace(" 0", " ")
-                lines.append(f"{local_label} {tz_abbrev} (UTC: {utc_str})")
+                slot_pairs.append((utc_dt, f"{local_label} {tz_abbrev} (UTC: {utc_str})"))
 
+        slot_pairs.sort(key=lambda p: p[0])
+        lines = [s for _, s in slot_pairs]
+
+        window_desc = day if window == 1 else f"{window} days starting {day}"
         if not lines:
-            return f"No available slots found for {day}."
+            return f"No available slots found for {window_desc}."
         return (
-            f"Available slots for {day} ({session.selected_event['title']}):\n"
+            f"Available slots for {window_desc} ({session.selected_event['title']}):\n"
             + "\n".join(lines)
         )
 
@@ -432,7 +545,7 @@ def build_tools(session):
         if not CAL_API_KEY:
             return "Error: CALCOM_API_KEY is not set; can't query bookings."
         try:
-            r = requests.get(
+            r = _HTTP.get(
                 f"{CAL_BASE}/bookings",
                 headers=_cal_headers(),
                 params={"attendeeEmail": email, "status": "past", "take": 5},
