@@ -517,7 +517,11 @@ async def calcom_oauth_callback(code: str = None, state: str = None,
     if session_id and AGENT_AVAILABLE:
         agent_manager.set_calcom_connected(session_id)
 
-    return RedirectResponse(url="https://cal.com")
+    from urllib.parse import urlencode
+    params = {"calcom_connected": "1"}
+    if session_id:
+        params["session_id"] = session_id
+    return RedirectResponse(url=f"{FRONTEND_URL}/chat?{urlencode(params)}")
  
  
 # ══════════════════════════════════════════════════════════════════════
@@ -608,9 +612,6 @@ async def google_oauth_callback(code: str = None, state: str = None,
         db.commit()
         if session_id and AGENT_AVAILABLE:
             agent_manager.set_google_connected(session_id)
-        return {"message": "✅ Google connected! Close this tab and return to the chat.",
-                "email": user_email, "coach_id": user.id}
- 
     else:  # participant
         user = db.query(models.Participant).filter(models.Participant.email == user_email).first()
         if not user:
@@ -622,8 +623,12 @@ async def google_oauth_callback(code: str = None, state: str = None,
         db.commit()
         if session_id and AGENT_AVAILABLE:
             agent_manager.set_google_connected(session_id)
-        return {"message": "✅ Google connected! Close this tab and return to the chat.",
-                "email": user_email, "participant_id": user.id}
+
+    from urllib.parse import urlencode
+    params = {"google_connected": "1", "user_type": user_type}
+    if session_id:
+        params["session_id"] = session_id
+    return RedirectResponse(url=f"{FRONTEND_URL}/chat?{urlencode(params)}")
  
  
 @app.post("/auth/google/callback", response_model=schemas.TokenResponse, tags=["Google OAuth"])

@@ -518,8 +518,21 @@ def build_tools(session):
             return f"Booking failed: {result['error']}"
 
         booking_uid = result.get("uid") or result.get("id") or "unknown"
-        meeting_url = result.get("meetingUrl") or result.get("location") or ""
-        session.last_booking_uid = str(booking_uid)
+        meeting_url = (
+    result.get("meetingUrl")
+    or result.get("videoCallUrl")
+    or next(
+        (
+            ref.get("meetingUrl") or ref.get("meetingPassword", "")
+            for ref in (result.get("references") or [])
+            if ref.get("meetingUrl")
+        ),
+        None,
+    )
+    or (result.get("location", {}).get("videoCallUrl") if isinstance(result.get("location"), dict) else None)
+    or (result.get("location") if isinstance(result.get("location"), str) else None)
+    or ""
+)       
         msg = (
             f"Booked! {session.selected_event['title']} at {slot_time} "
             f"for {session.participant_name} <{session.participant_email}>. "

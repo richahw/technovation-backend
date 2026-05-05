@@ -6,6 +6,7 @@ No exceptions are propagated to the caller.
 """
 
 import os
+import re
 import time
 import requests
 
@@ -79,6 +80,19 @@ def get_event_hosts(slug: str) -> list[dict]:
     return list(event.get("hosts") or [])
 
 
+_MD_BOLD = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+_MD_ITALIC = re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", re.DOTALL)
+
+
+def _strip_markdown(text: str) -> str:
+    """Remove markdown bold/italic wrappers Cal.com sometimes embeds in labels."""
+    if not text:
+        return text
+    text = _MD_BOLD.sub(r"\1", text)
+    text = _MD_ITALIC.sub(r"\1", text)
+    return text.strip()
+
+
 def get_booking_questions(slug: str) -> list[dict]:
     """
     Return the non-hidden booking-field questions for the given event.
@@ -97,7 +111,7 @@ def get_booking_questions(slug: str) -> list[dict]:
         questions.append({
             "slug": field.get("slug"),
             "type": field.get("type"),
-            "label": field.get("label") or field.get("slug"),
+            "label": _strip_markdown(field.get("label") or field.get("slug") or ""),
             "required": bool(field.get("required")),
             "options": field.get("options"),
             "is_default": bool(field.get("isDefault")),

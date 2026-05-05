@@ -14,8 +14,6 @@ from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
 from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic.v1 import SecretStr  # type: ignore[import-untyped]
-
 from coaching_agent.tools import build_tools
 
 load_dotenv()
@@ -24,10 +22,9 @@ load_dotenv()
 # LLM
 # ---------------------------------------------------------------------------
 
-_anthropic_key = os.getenv("ANTHROPIC_API_KEY")
 llm = ChatAnthropic(
     model_name="claude-sonnet-4-6",
-    api_key=SecretStr(_anthropic_key) if _anthropic_key else None,
+    api_key=os.getenv("ANTHROPIC_API_KEY"),
     temperature=0,
     timeout=60,
     stop=None,
@@ -58,10 +55,16 @@ After set_user_role('coach'):
 
 1. Ask the coach to connect their Cal.com account. Call get_calcom_oauth_url and share the link.
    Tell them to finish setting up their profile, event type, and availability on Cal.com.
-2. Once check_calcom_connected returns 'connected', ask the rebooking question:
+2. Once check_calcom_connected returns 'connected' (the live state block also shows
+   `cal.com connected: True`), the coach has just returned from the OAuth flow. Open your
+   next reply with a warm, explicit acknowledgment that their Cal.com account is connected
+   (something like "Great — your Cal.com account is connected!") BEFORE moving on. Then,
+   in the SAME message, ask the rebooking question:
        "If a participant cancels, are you comfortable with them rebooking a new time with you?"
    Accept yes/no and call save_coach_preferences(open_to_rebooking=True/False). If the coach
    record isn't linked yet, ask for the email they used on Cal.com and pass it as coach_email.
+   Do NOT skip the acknowledgment — even if the user's incoming message is terse like
+   "I've connected my Cal.com account.", they still want confirmation that the system saw it.
 3. Thank them and confirm their profile is ready.
 
 ============================================================
@@ -125,6 +128,12 @@ Step 4 — Use the booking-form questions returned by select_coaching_event:
     label returned by Cal.com. Required fields are labeled [REQUIRED]; you MUST collect
     every required one. Optional fields can be skipped if the participant has nothing to
     say, but offer each one.
+  - Treat optional follow-up question fields as a SERIES (e.g. question-1, question-2,
+    question-3, or any group of optional fields whose labels read as "another question",
+    "additional question", "anything else"). As soon as the participant declines one in
+    the series ("no", "no second question", "I'm good", "nothing else"), STOP offering
+    the remaining follow-ups in that same series and move on to the next step. Don't ask
+    "do you have a third question?" after they've already said they don't have a second.
   - For select-type fields, present the options verbatim and have the participant choose.
   - For boolean/acknowledgment fields, read the text and ask "do you acknowledge? (yes/no)".
   - After each answer, call save_booking_answer(slug, value). For booleans pass "true" or
@@ -175,6 +184,12 @@ GENERAL RULES
 - Never fabricate events or booking confirmations. If a tool returns an error, explain it
   clearly in plain language and suggest what to try.
 - Be concise and friendly.
+- Reply in plain text only. Do NOT use markdown formatting — no **bold**, no *italics*,
+  no backticks, no headings. The chat frontend renders text verbatim, so asterisks and
+  other markdown markers show up as literal characters and look wrong. When you need to
+  present a Cal.com question label, quote it as plain text (e.g. say: What is one
+  question you have about the coding of your project?) without wrapping it in any
+  formatting.
 """
 
 # The static portion of the system prompt is cached across turns; today's date
